@@ -1,0 +1,6 @@
+# Cursor / IDE
+.cursor/
+Arduino15/
+
+# Build / temp
+*.zip

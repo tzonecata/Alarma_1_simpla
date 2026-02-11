@@ -1,0 +1,10 @@
+compile:
+python -m platformio run
+python -m platformio run -j 1
+
+flash: 
+python -m platformio run -t upload --upload-port COM10
+
+
+
+facut de:  Alex Cata TONE 

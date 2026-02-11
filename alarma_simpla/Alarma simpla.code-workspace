@@ -1,0 +1,26 @@
+{
+	"folders": [
+		{
+			"path": ".."
+		},
+		{
+			"name": "alarma_simpla",
+			"path": "."
+		}
+	],
+	"settings": {
+		"scm.diffDecorations": "all",
+		"scm.diffDecorationsGutterWidth": 5,
+		"editor.renderLineHighlight": "all",
+		"editor.renderLineHighlightOnlyWhenFocus": false,
+		"workbench.colorCustomizations": {
+			"editorGutter.modifiedBackground": "#FFD54F",
+			"editorGutter.addedBackground": "#00E676",
+			"editorGutter.deletedBackground": "#FF5252",
+			"editorOverviewRuler.modifiedForeground": "#FFD54F",
+			"editorOverviewRuler.addedForeground": "#00E676",
+			"editorOverviewRuler.deletedForeground": "#FF5252",
+			"editor.lineHighlightBackground": "#2A2F3A"
+		}
+	}
+}
