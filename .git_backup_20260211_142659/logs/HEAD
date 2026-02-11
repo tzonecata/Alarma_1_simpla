@@ -1,6 +1,0 @@
-0000000000000000000000000000000000000000 3f8985e073896667f7743866e7136b1b60ed039b Catalin TONE <ctone@ausy-group.com> 1769878175 +0200	commit (initial): Initial commit -Alarma simpla
-3f8985e073896667f7743866e7136b1b60ed039b 0000000000000000000000000000000000000000 Catalin TONE <ctone@ausy-group.com> 1769878401 +0200	Branch: renamed refs/heads/master to refs/heads/main
-0000000000000000000000000000000000000000 3f8985e073896667f7743866e7136b1b60ed039b Catalin TONE <ctone@ausy-group.com> 1769878401 +0200	Branch: renamed refs/heads/master to refs/heads/main
-3f8985e073896667f7743866e7136b1b60ed039b 9154829b591b17b256720c51d36120f46691a29d Catalin TONE <ctone@ausy-group.com> 1769879405 +0200	commit: adaugat folder Alarma Simpla cu proiectul
-9154829b591b17b256720c51d36120f46691a29d 5de0b297d8ba48de14b55f7e085a39c1730d7be6 Catalin TONE <ctone@ausy-group.com> 1770812089 +0200	commit: Restructure PlatformIO project and update ESP8266 runtime logging
-5de0b297d8ba48de14b55f7e085a39c1730d7be6 2c32de3e33326f21c57456021ab03052db020360 Catalin TONE <ctone@ausy-group.com> 1770812582 +0200	commit: 1_ alarma simpla in c++)

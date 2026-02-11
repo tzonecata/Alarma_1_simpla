@@ -4,3 +4,5 @@ Arduino15/
 
 # Build / temp
 *.zip
+
+.git_backup_*/
