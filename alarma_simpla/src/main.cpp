@@ -28,8 +28,8 @@ PubSubClient mqttClient(espClient);
 // PIR-uri (4 zone). Numerotare: PIR1..PIR4
 // Aici folosim pini „D1, D2, D7, D0” de pe NodeMCU ca exemplu.
 static const int PIN_PIR[4] = {
-  5,   // PIR1  -> GPIO5  (D1)
-  4,   // PIR2  -> GPIO4  (D2)
+  14,  // PIR1  -> GPIO14 (D5)
+  12,  // PIR2  -> GPIO12 (D6)
   13,  // PIR3  -> GPIO13 (D7)
   16   // PIR4  -> GPIO16 (D0)
 };
@@ -39,8 +39,8 @@ static const int PIN_PIR[4] = {
 //  - IN la LOW => releu ON
 //  - IN la HIGH => releu OFF
 // Dacă modulul tău este activ HIGH, inversează nivelurile mai jos.
-static const int PIN_RELAY1 = 14;  // IN1 -> GPIO14 (D5)
-static const int PIN_RELAY2 = 12;  // IN2 -> GPIO12 (D6)
+static const int PIN_RELAY1_INTERNET = 4;  // IN1 -> GPIO4 (D2)  (internet cut)
+static const int PIN_RELAY2 = 5;  // IN2 -> GPIO5 (D1)  (siren)
 
 // LED de stare: folosim LED-ul on-board
 static const int PIN_LED = LED_BUILTIN;  // pe ESP8266 este de obicei GPIO2 (D4), activ LOW
@@ -63,6 +63,8 @@ static const uint32_t LONG_PRESS_MS = 2'000;        // apăsare lungă pentru ar
 static const uint32_t DEBOUNCE_MS = 40;
 static const uint32_t GOOGLE_PING_INTERVAL_MS = 60'000;
 static const uint32_t CLOCK_REPORT_INTERVAL_MS = 300'000;
+static const uint32_t INTERNET_RELAY_PULSE_MS = 5000;
+static const uint32_t INTERNET_RELAY_COOLDOWN_MS = 300'000;
 static const IPAddress GOOGLE_PING_IP(8, 8, 8, 8);
 
 // ----------------------------
@@ -82,10 +84,14 @@ static uint32_t lastClockReportMs = 0;
 static uint32_t pingCounter = 0;
 static bool pingDownActive = false;
 static time_t pingDownStartRealEpoch = 0;
+static bool internetCutActive = false;  // D2 active LOW când cade ping
+static uint32_t internetCutUntilMs = 0;
+static uint32_t internetRelayNextAllowedMs = 0;
 static bool ntpStarted = false;
 static bool ntpReadyLogged = false;
 static bool ntpWaitingLogged = false;
 static uint32_t lastHttpTimeTryMs = 0;
+static String serialRxLine;
 
 // Forward declarations pentru MQTT
 static const char* stateToString(AlarmState s);
@@ -100,11 +106,18 @@ static void mqttCallback(char* topic, uint8_t* payload, unsigned int length);
 static void enterState(AlarmState s);
 static void connectWifi();
 static void pingGoogleIfNeeded();
+static void runPingNow();
+static void performPingAndReport();
 static void ensureTimeSyncIfNeeded();
 static void tryHttpTimeSyncIfNeeded();
 static bool getLocalTimeSafe(struct tm* outTm);
 static void formatDateTime(char* out, size_t outSize, bool includeSeconds);
 static void printClockEvery5MinIfNeeded();
+static void updateInternetCutRelayPulse();
+static void handleSerialCommands();
+static void processSerialCommand(String cmd);
+static void printRuntimeStatus();
+static void startupRelayStartupTest();
 #endif
 
 // Buton
@@ -115,7 +128,7 @@ static uint32_t buttonPressStartMs = 0;
 static bool longPressHandled = false;
 
 static void setOutputs(bool relay1On, bool relay2On, bool ledOn) {
-  digitalWrite(PIN_RELAY1, relay1On ? RELAY_ON_LEVEL : RELAY_OFF_LEVEL);
+  digitalWrite(PIN_RELAY1_INTERNET, relay1On ? RELAY_ON_LEVEL : RELAY_OFF_LEVEL);
   digitalWrite(PIN_RELAY2, relay2On ? RELAY_ON_LEVEL : RELAY_OFF_LEVEL);
 
 #if defined(ESP8266)
@@ -133,18 +146,18 @@ static void enterState(AlarmState s) {
 
   switch (state) {
     case AlarmState::DISARMED:
-      setOutputs(false, false, false);
+      setOutputs(internetCutActive, false, false);
       break;
     case AlarmState::ARMING:
       // clipire lentă cât timp se armează
-      setOutputs(false, false, true);
+      setOutputs(internetCutActive, false, true);
       break;
     case AlarmState::ARMED:
-      setOutputs(false, false, true);
+      setOutputs(internetCutActive, false, true);
       break;
     case AlarmState::ALARMING:
       // ambele sirene ON + LED ON
-      setOutputs(true, true, true);
+      setOutputs(internetCutActive, true, true);
       alarmUntilMs = millis() + ALARM_DURATION_MS;
       break;
   }
@@ -313,8 +326,9 @@ static void ensureTimeSyncIfNeeded() {
     if (getLocalTimeSafe(&tmInfo)) {
       char ts[24];
       formatDateTime(ts, sizeof(ts), true);
-      Serial.print("REAL Date and time in Sibiu: ");
-      Serial.println(ts);
+      Serial.print("==== prima data citita : [");
+      Serial.print(ts);
+      Serial.println("] ====");
       Serial.println();
       ntpReadyLogged = true;
       ntpWaitingLogged = false;
@@ -322,6 +336,7 @@ static void ensureTimeSyncIfNeeded() {
       lastGooglePingMs = millis();
       pingDownActive = false;
       pingDownStartRealEpoch = 0;
+      internetCutActive = false;
     } else if (!ntpWaitingLogged) {
       Serial.println("Waiting for real internet time...");
       Serial.println();
@@ -418,16 +433,11 @@ static void connectMqtt() {
 }
 #endif
 
-static void pingGoogleIfNeeded() {
-  const uint32_t now = millis();
-  if ((now - lastGooglePingMs) < GOOGLE_PING_INTERVAL_MS) return;
-
+static void performPingAndReport() {
   struct tm tmNow;
   if (!getLocalTimeSafe(&tmNow)) {
     return;
   }
-
-  lastGooglePingMs = now;
   ++pingCounter;
 
   char ts[24];
@@ -442,6 +452,8 @@ static void pingGoogleIfNeeded() {
   if (ok) {
     pingDownActive = false;
     pingDownStartRealEpoch = 0;
+    internetCutActive = false;
+    internetCutUntilMs = 0;
 
     Serial.println();
     Serial.print(pingCounter);
@@ -452,6 +464,8 @@ static void pingGoogleIfNeeded() {
     Serial.print(Ping.averageTime());
     Serial.println(" ms)");
   } else {
+    const uint32_t nowMs = millis();
+
     if (!pingDownActive) {
       pingDownActive = true;
       pingDownStartRealEpoch = time(nullptr);
@@ -464,7 +478,34 @@ static void pingGoogleIfNeeded() {
       Serial.println("=============================================");
       Serial.println();
     }
+
+    if (!internetCutActive && (int32_t)(nowMs - internetRelayNextAllowedMs) >= 0) {
+      internetCutActive = true;
+      internetCutUntilMs = nowMs + INTERNET_RELAY_PULSE_MS;
+      internetRelayNextAllowedMs = nowMs + INTERNET_RELAY_PULSE_MS + INTERNET_RELAY_COOLDOWN_MS;
+    }
   }
+}
+
+static void updateInternetCutRelayPulse() {
+  if (!internetCutActive || internetCutUntilMs == 0) return;
+
+  const uint32_t now = millis();
+  if ((int32_t)(now - internetCutUntilMs) >= 0) {
+    internetCutActive = false;
+    internetCutUntilMs = 0;
+  }
+}
+
+static void pingGoogleIfNeeded() {
+  const uint32_t now = millis();
+  if ((now - lastGooglePingMs) < GOOGLE_PING_INTERVAL_MS) return;
+  lastGooglePingMs = now;
+  performPingAndReport();
+}
+
+static void runPingNow() {
+  performPingAndReport();
 }
 
 static void printClockEvery5MinIfNeeded() {
@@ -484,20 +525,128 @@ static void printClockEvery5MinIfNeeded() {
   Serial.println();
 }
 
+static void printRuntimeStatus() {
+  char ts[24];
+  formatDateTime(ts, sizeof(ts), true);
+  Serial.println("=== STATUS ===");
+  Serial.print("Time: ");
+  Serial.println(ts);
+  Serial.print("Alarm state: ");
+  Serial.println(stateToString(state));
+  Serial.print("WiFi: ");
+  Serial.println(WiFi.status() == WL_CONNECTED ? "CONNECTED" : "DISCONNECTED");
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+  }
+  Serial.print("Ping counter: ");
+  Serial.println(pingCounter);
+  Serial.println("==============");
+  Serial.println();
+}
+
+static void processSerialCommand(String cmd) {
+  cmd.trim();
+  cmd.toUpperCase();
+  if (cmd.length() == 0) return;
+
+  if (cmd == "ARM") {
+    if (state == AlarmState::DISARMED) {
+      enterState(AlarmState::ARMING);
+      Serial.println("UART CMD: ARM -> OK");
+    } else {
+      Serial.println("UART CMD: ARM -> already armed/arming/alarming");
+    }
+    Serial.println();
+    return;
+  }
+
+  if (cmd == "DISARM") {
+    enterState(AlarmState::DISARMED);
+    Serial.println("UART CMD: DISARM -> OK");
+    Serial.println();
+    return;
+  }
+
+  if (cmd == "STATUS") {
+    printRuntimeStatus();
+    return;
+  }
+
+  if (cmd == "PINGNOW") {
+    Serial.println("UART CMD: PINGNOW");
+    runPingNow();
+    Serial.println();
+    return;
+  }
+
+  if (cmd == "HELP") {
+    Serial.println("UART commands: ARM, DISARM, STATUS, PINGNOW, HELP");
+    Serial.println();
+    return;
+  }
+
+  Serial.print("UART CMD unknown: ");
+  Serial.println(cmd);
+  Serial.println("Try: HELP");
+  Serial.println();
+}
+
+static void handleSerialCommands() {
+  while (Serial.available() > 0) {
+    const char c = static_cast<char>(Serial.read());
+    if (c == '\r') continue;
+    if (c == '\n') {
+      processSerialCommand(serialRxLine);
+      serialRxLine = "";
+      continue;
+    }
+
+    if (serialRxLine.length() < 80) {
+      serialRxLine += c;
+    }
+  }
+}
+
+static void startupRelayStartupTest() {
+  Serial.println("Startup test: RELAY1 x2, then RELAY2 x2");
+
+  for (int i = 0; i < 2; ++i) {
+    digitalWrite(PIN_RELAY1_INTERNET, RELAY_ON_LEVEL);
+    delay(1000);
+    digitalWrite(PIN_RELAY1_INTERNET, RELAY_OFF_LEVEL);
+    delay(1000);
+  }
+
+  for (int i = 0; i < 2; ++i) {
+    digitalWrite(PIN_RELAY2, RELAY_ON_LEVEL);
+    delay(1000);
+    digitalWrite(PIN_RELAY2, RELAY_OFF_LEVEL);
+    delay(1000);
+  }
+
+  digitalWrite(PIN_RELAY1_INTERNET, RELAY_OFF_LEVEL);
+  digitalWrite(PIN_RELAY2, RELAY_OFF_LEVEL);
+  Serial.println("Startup test done.");
+  Serial.println();
+}
+
 void setup() {
   Serial.begin(115200);
   Serial.setDebugOutput(true);
+  serialRxLine.reserve(96);
   Serial.println();
   Serial.println("Alarma simpla starting...");
   for (int i = 0; i < 4; ++i) {
     pinMode(PIN_PIR[i], INPUT);
   }
-  pinMode(PIN_RELAY1, OUTPUT);
+  pinMode(PIN_RELAY1_INTERNET, OUTPUT);
   pinMode(PIN_RELAY2, OUTPUT);
   pinMode(PIN_LED, OUTPUT);
   pinMode(PIN_BUTTON, INPUT_PULLUP);
 
   setOutputs(false, false, false);
+  startupRelayStartupTest();
   enterState(AlarmState::DISARMED);
 
   connectWifi();
@@ -510,19 +659,21 @@ void setup() {
 void loop() {
   const uint32_t now = millis();
 
+  updateInternetCutRelayPulse();
+  handleSerialCommands();
   updateButton();
 
   switch (state) {
     case AlarmState::DISARMED:
       // LED blink în starea dezarmată
-      setOutputs(false, false, ((now / 500) % 2) == 0);
+      setOutputs(internetCutActive, false, ((now / 500) % 2) == 0);
       break;
 
     case AlarmState::ARMING:
       {
         // clipire lentă pe durata arming
         const bool blink = ((now / 500) % 2) == 0;
-        setOutputs(false, false, blink);
+        setOutputs(internetCutActive, false, blink);
 
         if (now - stateSinceMs >= EXIT_DELAY_MS) {
           enterState(AlarmState::ARMED);
@@ -533,7 +684,7 @@ void loop() {
     case AlarmState::ARMED:
       {
         // LED ON constant ca indicator
-        setOutputs(false, false, true);
+        setOutputs(internetCutActive, false, true);
 
         if (motionDetected()) {
           enterState(AlarmState::ALARMING);
@@ -544,7 +695,7 @@ void loop() {
     case AlarmState::ALARMING:
       {
         // Sirenă continuă (simplu). Dacă vrei ton intermitent, schimbă aici.
-        setOutputs(true, true, true);
+        setOutputs(internetCutActive, true, true);
 
         if (now >= alarmUntilMs) {
           // rămâne armat după alarmă
@@ -563,3 +714,5 @@ void loop() {
   pingGoogleIfNeeded();
   printClockEvery5MinIfNeeded();
 }
+
+
