@@ -3,10 +3,19 @@
 #define ALARMA_SIMPLA_CONFIG_H
 
 // WiFi
+static const char* WIFI_SSID = "TP-Link_583B";      // de test la munca 
+static const char* WIFI_PASSWORD = "MicroEJ_21";
+
+// static const char* WIFI_SSID = "TP-Link_2F48";  // la TEREN . 
+// static const char* WIFI_PASSWORD = "10782279";
+
+
 // static const char* WIFI_SSID = "tzone";
 // static const char* WIFI_PASSWORD = "19821981";
-static const char* WIFI_SSID = "TP-Link_583B";
-static const char* WIFI_PASSWORD = "MicroEJ_21";
+
+
+
+
 // static const char* WIFI_SSID = "RD_GUEST_SIBIU";
 // static const char* WIFI_PASSWORD = "U3cC2#d6Fy@@";
 // MQTT (dezactivat)

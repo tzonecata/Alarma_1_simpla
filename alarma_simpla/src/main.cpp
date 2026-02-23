@@ -63,8 +63,12 @@ static const uint32_t LONG_PRESS_MS = 2'000;        // apăsare lungă pentru ar
 static const uint32_t DEBOUNCE_MS = 40;
 static const uint32_t GOOGLE_PING_INTERVAL_MS = 60'000;
 static const uint32_t CLOCK_REPORT_INTERVAL_MS = 300'000;
-static const uint32_t INTERNET_RELAY_PULSE_MS = 5000;
+static const uint32_t FAST_STARTUP_WINDOW_MS = 60'000;
+static const uint32_t FAST_STARTUP_PING_INTERVAL_MS = 10'000;
+static const uint32_t FAST_STARTUP_CLOCK_INTERVAL_MS = 5'000;
+static const uint32_t INTERNET_RELAY_PULSE_MS = 10'000;
 static const uint32_t INTERNET_RELAY_COOLDOWN_MS = 300'000;
+static const uint32_t WIFI_DISCONNECT_RELAY_RETRY_MS = 120'000;
 static const IPAddress GOOGLE_PING_IP(8, 8, 8, 8);
 
 // ----------------------------
@@ -87,6 +91,7 @@ static time_t pingDownStartRealEpoch = 0;
 static bool internetCutActive = false;  // D2 active LOW când cade ping
 static uint32_t internetCutUntilMs = 0;
 static uint32_t internetRelayNextAllowedMs = 0;
+static uint32_t wifiDisconnectedSinceMs = 0;
 static bool ntpStarted = false;
 static bool ntpReadyLogged = false;
 static bool ntpWaitingLogged = false;
@@ -110,10 +115,13 @@ static void runPingNow();
 static void performPingAndReport();
 static void ensureTimeSyncIfNeeded();
 static void tryHttpTimeSyncIfNeeded();
+static uint32_t currentPingIntervalMs();
+static uint32_t currentClockReportIntervalMs();
 static bool getLocalTimeSafe(struct tm* outTm);
 static void formatDateTime(char* out, size_t outSize, bool includeSeconds);
 static void printClockEvery5MinIfNeeded();
 static void updateInternetCutRelayPulse();
+static void handleWifiReconnectRelayRetry();
 static void handleSerialCommands();
 static void processSerialCommand(String cmd);
 static void printRuntimeStatus();
@@ -392,6 +400,20 @@ static bool getLocalTimeSafe(struct tm* outTm) {
   return true;
 }
 
+static uint32_t currentPingIntervalMs() {
+  if (millis() < FAST_STARTUP_WINDOW_MS) {
+    return FAST_STARTUP_PING_INTERVAL_MS;
+  }
+  return GOOGLE_PING_INTERVAL_MS;
+}
+
+static uint32_t currentClockReportIntervalMs() {
+  if (millis() < FAST_STARTUP_WINDOW_MS) {
+    return FAST_STARTUP_CLOCK_INTERVAL_MS;
+  }
+  return CLOCK_REPORT_INTERVAL_MS;
+}
+
 static void formatDateTime(char* out, size_t outSize, bool includeSeconds) {
   struct tm tmInfo;
   if (!getLocalTimeSafe(&tmInfo)) {
@@ -497,9 +519,32 @@ static void updateInternetCutRelayPulse() {
   }
 }
 
+static void handleWifiReconnectRelayRetry() {
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiDisconnectedSinceMs = 0;
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (wifiDisconnectedSinceMs == 0) {
+    wifiDisconnectedSinceMs = now;
+    return;
+  }
+
+  if ((now - wifiDisconnectedSinceMs) < WIFI_DISCONNECT_RELAY_RETRY_MS) return;
+  if (internetCutActive) return;
+
+  internetCutActive = true;
+  internetCutUntilMs = now + INTERNET_RELAY_PULSE_MS;
+  wifiDisconnectedSinceMs = now;
+
+  Serial.println("WiFi disconnected for 2 minutes -> INTERNET relay ON for 10s");
+  Serial.println();
+}
+
 static void pingGoogleIfNeeded() {
   const uint32_t now = millis();
-  if ((now - lastGooglePingMs) < GOOGLE_PING_INTERVAL_MS) return;
+  if ((now - lastGooglePingMs) < currentPingIntervalMs()) return;
   lastGooglePingMs = now;
   performPingAndReport();
 }
@@ -513,7 +558,7 @@ static void printClockEvery5MinIfNeeded() {
   if (!getLocalTimeSafe(&tmNow)) return;
 
   const uint32_t now = millis();
-  if ((now - lastClockReportMs) < CLOCK_REPORT_INTERVAL_MS) return;
+  if ((now - lastClockReportMs) < currentClockReportIntervalMs()) return;
   lastClockReportMs = now;
 
   char ts[24];
@@ -660,6 +705,7 @@ void loop() {
   const uint32_t now = millis();
 
   updateInternetCutRelayPulse();
+  handleWifiReconnectRelayRetry();
   handleSerialCommands();
   updateButton();
 

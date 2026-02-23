@@ -6,8 +6,7 @@ flash:
 python -m platformio run -t upload --upload-port COM10
 
 monitor:
-python -m platformio device monitor -b 115200 --port COM14
-
+python -m platformio device monitor -b 115200 --port COM15
 
 
 facut de:  Alex Cata TONE 
