@@ -62,14 +62,15 @@ static const uint32_t MOTION_RETRIGGER_MS = 2'000;  // ignoră re-trigger-uri PI
 static const uint32_t LONG_PRESS_MS = 2'000;        // apăsare lungă pentru arm/dezarm
 static const uint32_t DEBOUNCE_MS = 40;
 static const uint32_t GOOGLE_PING_INTERVAL_MS = 60'000;
-static const uint32_t CLOCK_REPORT_INTERVAL_MS = 300'000;
+static const uint32_t STATUS_AUTO_INTERVAL_MS = 30'000;
 static const uint32_t FAST_STARTUP_WINDOW_MS = 60'000;
 static const uint32_t FAST_STARTUP_PING_INTERVAL_MS = 10'000;
-static const uint32_t FAST_STARTUP_CLOCK_INTERVAL_MS = 5'000;
 static const uint32_t INTERNET_RELAY_PULSE_MS = 10'000;
 static const uint32_t INTERNET_RELAY_COOLDOWN_MS = 300'000;
 static const uint32_t WIFI_DISCONNECT_RELAY_RETRY_MS = 120'000;
+static const uint32_t EMULATE_WIFI_RETRY_CONNECT_MS = 10'000;
 static const IPAddress GOOGLE_PING_IP(8, 8, 8, 8);
+static const char* ROMANIA_TZ = "EET-2EEST,M3.5.0/3,M10.5.0/4";
 
 // ----------------------------
 // Stare
@@ -84,18 +85,24 @@ static uint32_t stateSinceMs = 0;
 static uint32_t alarmUntilMs = 0;
 static uint32_t lastMotionMs[4] = { 0, 0, 0, 0 };
 static uint32_t lastGooglePingMs = 0;
-static uint32_t lastClockReportMs = 0;
 static uint32_t pingCounter = 0;
 static bool pingDownActive = false;
 static time_t pingDownStartRealEpoch = 0;
+static time_t lastWifiDisconnectRealEpoch = 0;
 static bool internetCutActive = false;  // D2 active LOW când cade ping
 static uint32_t internetCutUntilMs = 0;
 static uint32_t internetRelayNextAllowedMs = 0;
 static uint32_t wifiDisconnectedSinceMs = 0;
+static bool prevWifiConnected = false;
+static bool emulateWifiOff = false;
+static bool emulateWifiOffLogged = false;
+static uint32_t emulateWifiLastConnectTryMs = 0;
 static bool ntpStarted = false;
 static bool ntpReadyLogged = false;
 static bool ntpWaitingLogged = false;
 static uint32_t lastHttpTimeTryMs = 0;
+static uint32_t lastAutoStatusMs = 0;
+static uint32_t statusPrintCounter = 0;
 static String serialRxLine;
 
 // Forward declarations pentru MQTT
@@ -110,21 +117,29 @@ static void mqttCallback(char* topic, uint8_t* payload, unsigned int length);
 #else
 static void enterState(AlarmState s);
 static void connectWifi();
+static bool isRealWifiConnected();
+static bool isWifiConnected();
 static void pingGoogleIfNeeded();
 static void runPingNow();
 static void performPingAndReport();
+static void applyRomaniaTimezone();
 static void ensureTimeSyncIfNeeded();
 static void tryHttpTimeSyncIfNeeded();
 static uint32_t currentPingIntervalMs();
-static uint32_t currentClockReportIntervalMs();
 static bool getLocalTimeSafe(struct tm* outTm);
+static void formatDurationMs(uint32_t durationMs, char* out, size_t outSize);
+static void formatEpochDateTime(time_t epoch, char* out, size_t outSize, bool includeSeconds);
 static void formatDateTime(char* out, size_t outSize, bool includeSeconds);
-static void printClockEvery5MinIfNeeded();
+static void logEvent(const char* message);
 static void updateInternetCutRelayPulse();
 static void handleWifiReconnectRelayRetry();
+static void enforceInternetRelayOffWhenWifiConnected();
+static void updateWifiDisconnectTracking();
+static void printStatusEvery30SecIfNeeded();
 static void handleSerialCommands();
 static void processSerialCommand(String cmd);
 static void printRuntimeStatus();
+static void printBootInfo();
 static void startupRelayStartupTest();
 #endif
 
@@ -173,9 +188,9 @@ static void enterState(AlarmState s) {
 #if 0
   publishState();
 #endif
-  Serial.print("State -> ");
-  Serial.println(stateToString(state));
-  Serial.println();
+  char eventMsg[48];
+  snprintf(eventMsg, sizeof(eventMsg), "Alarm state -> %s", stateToString(state));
+  logEvent(eventMsg);
 }
 
 static void toggleArmDisarm() {
@@ -291,8 +306,42 @@ static void mqttCallback(char* topic, uint8_t* payload, unsigned int length) {
 }
 #endif
 
+static bool isWifiConnected() {
+  if (emulateWifiOff) return false;
+  return WiFi.status() == WL_CONNECTED;
+}
+
+static bool isRealWifiConnected() {
+  return WiFi.status() == WL_CONNECTED;
+}
+
 static void connectWifi() {
-  if (WiFi.status() == WL_CONNECTED) return;
+  if (isRealWifiConnected()) {
+    if (emulateWifiOff) {
+      emulateWifiOff = false;
+      emulateWifiOffLogged = false;
+      wifiDisconnectedSinceMs = 0;
+      logEvent("EMULATE_WIFI_OFF canceled -> REAL_WIFI_CONNECTED");
+    }
+    return;
+  }
+
+  if (emulateWifiOff) {
+    if (!emulateWifiOffLogged) {
+      logEvent("WiFi emulation active -> forcing DISCONNECTED state");
+      emulateWifiOffLogged = true;
+    }
+
+    const uint32_t now = millis();
+    if ((now - emulateWifiLastConnectTryMs) >= EMULATE_WIFI_RETRY_CONNECT_MS) {
+      emulateWifiLastConnectTryMs = now;
+      WiFi.mode(WIFI_STA);
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    }
+    return;
+  }
+
+  emulateWifiOffLogged = false;
 
   WiFi.mode(WIFI_STA);
   Serial.print("Connecting to WiFi: '");
@@ -302,28 +351,38 @@ static void connectWifi() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15'000) {
+  while (!isWifiConnected() && millis() - start < 15'000) {
     delay(250);
   }
 
-  if (WiFi.status() == WL_CONNECTED) {
+  if (isWifiConnected()) {
     Serial.print("WiFi connected, IP: ");
     Serial.println(WiFi.localIP());
     Serial.println();
+    logEvent("WiFi connect success");
   } else {
     Serial.println("WiFi connect failed");
     Serial.println();
+    logEvent("WiFi connect failed");
   }
 }
 
+static void applyRomaniaTimezone() {
+  setenv("TZ", ROMANIA_TZ, 1);
+  tzset();
+}
+
 static void ensureTimeSyncIfNeeded() {
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (!isWifiConnected()) return;
 
   if (!ntpStarted) {
-    // Timezone: Sibiu, Romania
-    setenv("TZ", "EET-2EEST,M3.5.0/3,M10.5.0/4", 1);
-    tzset();
+    // Force timezone Romania and start NTP using TZ-aware API.
+    applyRomaniaTimezone();
+#if defined(ESP8266)
+    configTzTime(ROMANIA_TZ, "pool.ntp.org", "time.google.com");
+#else
     configTime(0, 0, "pool.ntp.org", "time.google.com");
+#endif
     ntpStarted = true;
     Serial.println("NTP sync started (Sibiu, RO)");
     Serial.println();
@@ -379,8 +438,7 @@ static void tryHttpTimeSyncIfNeeded() {
         setenv("TZ", "UTC0", 1);
         tzset();
         time_t utcEpoch = mktime(&tmUtc);
-        setenv("TZ", "EET-2EEST,M3.5.0/3,M10.5.0/4", 1);
-        tzset();
+        applyRomaniaTimezone();
         if (utcEpoch >= 1700000000) {
           timeval tv = {utcEpoch, 0};
           settimeofday(&tv, nullptr);
@@ -407,11 +465,12 @@ static uint32_t currentPingIntervalMs() {
   return GOOGLE_PING_INTERVAL_MS;
 }
 
-static uint32_t currentClockReportIntervalMs() {
-  if (millis() < FAST_STARTUP_WINDOW_MS) {
-    return FAST_STARTUP_CLOCK_INTERVAL_MS;
-  }
-  return CLOCK_REPORT_INTERVAL_MS;
+static void formatDurationMs(uint32_t durationMs, char* out, size_t outSize) {
+  const uint32_t totalSec = durationMs / 1000;
+  const uint32_t hours = totalSec / 3600;
+  const uint32_t minutes = (totalSec % 3600) / 60;
+  const uint32_t seconds = totalSec % 60;
+  snprintf(out, outSize, "%lu:%02lu:%02lu", static_cast<unsigned long>(hours), static_cast<unsigned long>(minutes), static_cast<unsigned long>(seconds));
 }
 
 static void formatDateTime(char* out, size_t outSize, bool includeSeconds) {
@@ -466,7 +525,7 @@ static void performPingAndReport() {
   formatDateTime(ts, sizeof(ts), true);
 
   bool ok = false;
-  if (WiFi.status() == WL_CONNECTED) {
+  if (isWifiConnected()) {
     ok = Ping.ping(GOOGLE_PING_IP, 1);
     Serial.println();
   }
@@ -499,13 +558,40 @@ static void performPingAndReport() {
       Serial.println("]  *FW by TONE :)*");
       Serial.println("=============================================");
       Serial.println();
+      logEvent("internet_DOWN_detected");
+      printRuntimeStatus();
     }
 
-    if (!internetCutActive && (int32_t)(nowMs - internetRelayNextAllowedMs) >= 0) {
+    if (!isWifiConnected() && !internetCutActive && (int32_t)(nowMs - internetRelayNextAllowedMs) >= 0) {
       internetCutActive = true;
       internetCutUntilMs = nowMs + INTERNET_RELAY_PULSE_MS;
       internetRelayNextAllowedMs = nowMs + INTERNET_RELAY_PULSE_MS + INTERNET_RELAY_COOLDOWN_MS;
+      logEvent("relay_1_ACTIVATED");
     }
+  }
+}
+
+static void logEvent(const char* message) {
+  char ts[24];
+  formatDateTime(ts, sizeof(ts), true);
+  Serial.print("[ EVENT= ");
+  Serial.print(message);
+  Serial.print("] :    ");
+  Serial.println(ts);
+}
+
+static void formatEpochDateTime(time_t epoch, char* out, size_t outSize, bool includeSeconds) {
+  if (epoch < 1700000000) {
+    snprintf(out, outSize, "NO_REAL_TIME");
+    return;
+  }
+
+  struct tm tmInfo;
+  localtime_r(&epoch, &tmInfo);
+  if (includeSeconds) {
+    strftime(out, outSize, "%d/%m/%Y %H:%M:%S", &tmInfo);
+  } else {
+    strftime(out, outSize, "%d/%m/%Y %H:%M", &tmInfo);
   }
 }
 
@@ -516,11 +602,21 @@ static void updateInternetCutRelayPulse() {
   if ((int32_t)(now - internetCutUntilMs) >= 0) {
     internetCutActive = false;
     internetCutUntilMs = 0;
+    logEvent("relay_1_DEACTIVATED");
   }
 }
 
+static void enforceInternetRelayOffWhenWifiConnected() {
+  if (!isWifiConnected()) return;
+  if (!internetCutActive && internetCutUntilMs == 0) return;
+
+  internetCutActive = false;
+  internetCutUntilMs = 0;
+  logEvent("relay_1_FORCED_INACTIVE_wifi_connected");
+}
+
 static void handleWifiReconnectRelayRetry() {
-  if (WiFi.status() == WL_CONNECTED) {
+  if (isWifiConnected()) {
     wifiDisconnectedSinceMs = 0;
     return;
   }
@@ -536,10 +632,8 @@ static void handleWifiReconnectRelayRetry() {
 
   internetCutActive = true;
   internetCutUntilMs = now + INTERNET_RELAY_PULSE_MS;
-  wifiDisconnectedSinceMs = now;
 
-  Serial.println("WiFi disconnected for 2 minutes -> INTERNET relay ON for 10s");
-  Serial.println();
+  logEvent("relay_1_ACTIVATED");
 }
 
 static void pingGoogleIfNeeded() {
@@ -553,40 +647,138 @@ static void runPingNow() {
   performPingAndReport();
 }
 
-static void printClockEvery5MinIfNeeded() {
-  struct tm tmNow;
-  if (!getLocalTimeSafe(&tmNow)) return;
-
-  const uint32_t now = millis();
-  if ((now - lastClockReportMs) < currentClockReportIntervalMs()) return;
-  lastClockReportMs = now;
-
-  char ts[24];
-  formatDateTime(ts, sizeof(ts), false);
-  Serial.println("=============================================");
-  Serial.print("[real time @5min] ");
-  Serial.println(ts);
-  Serial.println("=============================================");
-  Serial.println();
+static void updateWifiDisconnectTracking() {
+  const bool connected = isWifiConnected();
+  if (prevWifiConnected && !connected) {
+    lastWifiDisconnectRealEpoch = time(nullptr);
+    if (wifiDisconnectedSinceMs == 0) {
+      wifiDisconnectedSinceMs = millis();
+    }
+    logEvent("WiFi transition: CONNECTED -> DISCONNECTED");
+    printRuntimeStatus();
+  } else if (!prevWifiConnected && connected) {
+    logEvent("WiFi transition: DISCONNECTED -> CONNECTED");
+  }
+  prevWifiConnected = connected;
 }
 
 static void printRuntimeStatus() {
-  char ts[24];
-  formatDateTime(ts, sizeof(ts), true);
-  Serial.println("=== STATUS ===");
-  Serial.print("Time: ");
-  Serial.println(ts);
-  Serial.print("Alarm state: ");
+  ++statusPrintCounter;
+  char lastWifiDown[24];
+  formatEpochDateTime(lastWifiDisconnectRealEpoch, lastWifiDown, sizeof(lastWifiDown), true);
+  const uint32_t pingIntervalMs = currentPingIntervalMs();
+
+  Serial.println();
+  Serial.println();
+  Serial.print("=====  ");
+  Serial.print(statusPrintCounter);
+  Serial.println("  ===== >>");
+
+  Serial.println("🚨[ Stare alarmă]");
+  Serial.print("Alarmă: ");
   Serial.println(stateToString(state));
-  Serial.print("WiFi: ");
-  Serial.println(WiFi.status() == WL_CONNECTED ? "CONNECTED" : "DISCONNECTED");
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("IP: ");
+  Serial.print("Internet relay: ");
+  Serial.println(internetCutActive ? "ACTIVE" : "INACTIVE");
+  Serial.print("Ping down activ: ");
+  Serial.println(pingDownActive ? "YES" : "NO");
+  Serial.print("Ping down start: ");
+  char pingDownAt[24];
+  formatEpochDateTime(pingDownStartRealEpoch, pingDownAt, sizeof(pingDownAt), true);
+  Serial.println(pingDownAt);
+  Serial.println();
+
+  Serial.println("[🌐 Rețea WiFi]");
+  Serial.print("Status WiFi: ");
+  Serial.println(isWifiConnected() ? "CONNECTED" : "DISCONNECTED");
+  Serial.print("WiFi emulation: ");
+  Serial.println(emulateWifiOff ? "ON" : "OFF");
+  if (isWifiConnected()) {
+    Serial.print("IP local: ");
     Serial.println(WiFi.localIP());
+    Serial.print("Gateway: ");
+    Serial.println(WiFi.gatewayIP());
+    Serial.print("DNS: ");
+    Serial.println(WiFi.dnsIP());
+    Serial.print("rssi=");
+    Serial.println(WiFi.RSSI());
+  } else {
+    Serial.println("IP local: -");
+    Serial.println("Gateway: -");
+    Serial.println("DNS: -");
+    Serial.println("rssi=-");
   }
+  Serial.println();
+
+  Serial.println("[🌍 Conectivitate Internet]");
+  Serial.print("Ultima deconectare: ");
+  Serial.println(lastWifiDown);
+  char wifiDisconnectedFor[16];
+  if (wifiDisconnectedSinceMs == 0 || isWifiConnected()) {
+    snprintf(wifiDisconnectedFor, sizeof(wifiDisconnectedFor), "0:00:00");
+  } else {
+    const uint32_t disconnectedForMs = millis() - wifiDisconnectedSinceMs;
+    formatDurationMs(disconnectedForMs, wifiDisconnectedFor, sizeof(wifiDisconnectedFor));
+  }
+  Serial.print("WiFi disconnected since: ");
+  Serial.println(wifiDisconnectedFor);
   Serial.print("Ping counter: ");
   Serial.println(pingCounter);
-  Serial.println("==============");
+  Serial.print("Ping interval: ");
+  Serial.print(pingIntervalMs);
+  Serial.print(" ms (");
+  Serial.print(pingIntervalMs / 1000);
+  Serial.println(" sec)");
+  Serial.println();
+
+  Serial.println("⏱ Sistem");
+  Serial.print("NTP started: ");
+  Serial.println(ntpStarted ? "YES" : "NO");
+  Serial.print("NTP ready: ");
+  Serial.println(ntpReadyLogged ? "YES" : "NO");
+  Serial.print("Free heap: ");
+  Serial.println(ESP.getFreeHeap());
+  Serial.print("Chip ID: ");
+  Serial.println(ESP.getChipId(), HEX);
+  Serial.print("=====  ");
+  Serial.print(statusPrintCounter);
+  Serial.println("  =====  <<");
+  Serial.println();
+}
+
+static void printStatusEvery30SecIfNeeded() {
+  const uint32_t now = millis();
+  if ((now - lastAutoStatusMs) < STATUS_AUTO_INTERVAL_MS) return;
+  lastAutoStatusMs = now;
+  printRuntimeStatus();
+}
+
+static void printBootInfo() {
+  Serial.println("[BOOT] ===========================================");
+  Serial.print("[BOOT] FW build: ");
+  Serial.print(__DATE__);
+  Serial.print(" ");
+  Serial.println(__TIME__);
+  Serial.print("[BOOT] Chip ID: 0x");
+  Serial.println(ESP.getChipId(), HEX);
+  Serial.print("[BOOT] CPU freq (MHz): ");
+  Serial.println(ESP.getCpuFreqMHz());
+  Serial.print("[BOOT] Free heap: ");
+  Serial.println(ESP.getFreeHeap());
+  Serial.print("[BOOT] Reset reason: ");
+  Serial.println(ESP.getResetReason());
+  Serial.print("[BOOT] WiFi SSID: ");
+  Serial.println(WIFI_SSID);
+  Serial.print("[BOOT] Internet relay pin: GPIO");
+  Serial.println(PIN_RELAY1_INTERNET);
+  Serial.print("[BOOT] Relay pulse (ms): ");
+  Serial.println(INTERNET_RELAY_PULSE_MS);
+  Serial.print("[BOOT] WiFi retry trigger (ms): ");
+  Serial.println(WIFI_DISCONNECT_RELAY_RETRY_MS);
+  Serial.print("[BOOT] Ping interval normal (ms): ");
+  Serial.println(GOOGLE_PING_INTERVAL_MS);
+  Serial.print("[BOOT] Status auto interval (ms): ");
+  Serial.println(STATUS_AUTO_INTERVAL_MS);
+  Serial.println("[BOOT] ===========================================");
   Serial.println();
 }
 
@@ -625,8 +817,39 @@ static void processSerialCommand(String cmd) {
     return;
   }
 
+  if (cmd == "EMULATE_WIFI_OFF") {
+    emulateWifiOff = true;
+    emulateWifiOffLogged = false;
+    emulateWifiLastConnectTryMs = 0;
+    if (wifiDisconnectedSinceMs == 0) {
+      wifiDisconnectedSinceMs = millis();
+    }
+    WiFi.disconnect();
+    internetCutActive = true;
+    internetCutUntilMs = millis() + INTERNET_RELAY_PULSE_MS;
+    Serial.println("UART CMD: EMULATE_WIFI_OFF -> WiFi forced DISCONNECTED");
+    Serial.println("UART CMD: relay INTERNET ON immediately");
+    Serial.println();
+    logEvent("UART command: EMULATE_WIFI_OFF (relay ON immediate)");
+    return;
+  }
+
+  if (cmd == "EMULATE_WIFI_ON") {
+    emulateWifiOff = false;
+    emulateWifiOffLogged = false;
+    wifiDisconnectedSinceMs = 0;
+    internetCutActive = false;
+    internetCutUntilMs = 0;
+    Serial.println("UART CMD: EMULATE_WIFI_ON -> WiFi emulation disabled");
+    Serial.println("UART CMD: relay INTERNET forced INACTIVE");
+    connectWifi();
+    Serial.println();
+    logEvent("UART command: EMULATE_WIFI_ON");
+    return;
+  }
+
   if (cmd == "HELP") {
-    Serial.println("UART commands: ARM, DISARM, STATUS, PINGNOW, HELP");
+    Serial.println("UART commands: ARM, DISARM, STATUS, PINGNOW, EMULATE_WIFI_OFF, EMULATE_WIFI_ON, HELP");
     Serial.println();
     return;
   }
@@ -680,8 +903,10 @@ void setup() {
   Serial.begin(115200);
   Serial.setDebugOutput(true);
   serialRxLine.reserve(96);
+  lastAutoStatusMs = millis();
   Serial.println();
   Serial.println("Alarma simpla starting...");
+  printBootInfo();
   for (int i = 0; i < 4; ++i) {
     pinMode(PIN_PIR[i], INPUT);
   }
@@ -695,7 +920,9 @@ void setup() {
   enterState(AlarmState::DISARMED);
 
   connectWifi();
+  prevWifiConnected = isWifiConnected();
   ensureTimeSyncIfNeeded();
+  logEvent("Setup complete");
 #if 0
   connectMqtt();
 #endif
@@ -704,6 +931,9 @@ void setup() {
 void loop() {
   const uint32_t now = millis();
 
+  updateWifiDisconnectTracking();
+  enforceInternetRelayOffWhenWifiConnected();
+  printStatusEvery30SecIfNeeded();
   updateInternetCutRelayPulse();
   handleWifiReconnectRelayRetry();
   handleSerialCommands();
@@ -752,13 +982,12 @@ void loop() {
   }
 
   // WiFi menținut în viață din loop
-  if (WiFi.status() != WL_CONNECTED) {
+  if (!isWifiConnected()) {
     connectWifi();
   }
 
   ensureTimeSyncIfNeeded();
   pingGoogleIfNeeded();
-  printClockEvery5MinIfNeeded();
 }
 
 

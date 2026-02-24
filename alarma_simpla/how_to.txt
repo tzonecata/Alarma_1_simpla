@@ -1,12 +1,147 @@
-compile:
-python -m platformio run
-python -m platformio run -j 1
+﻿Dezvoltat de:
+  Alex Cata TONE
+==============================================
+comenzi:
+UART Commands:
+  - HELP
+    Afiseaza lista de comenzi UART disponibile.
+  - STATUS
+    Afiseaza status complet: timp, uptime, stare alarma, WiFi, IP/RSSI, NTP, ping,
+    stare relee, memorie, etc.
+  - ARM
+    Armeaza alarma (trece in starea ARMING, apoi ARMED).
+  - DISARM
+    Dezarmeaza alarma imediat (stare DISARMED).
+  - PINGNOW
+    Ruleaza imediat un ping de test catre Internet.
+  - EMULATE_WIFI_OFF
+    Forteaza starea WiFi = DISCONNECTED (pentru test).
+    Sistemul se comporta ca si cum a picat conexiunea la router.
+  - EMULATE_WIFI_ON
+    Opreste emularea WiFi OFF si revine la conectarea WiFi normala.
 
-flash: 
-python -m platformio run -t upload --upload-port COM10
 
-monitor:
-python -m platformio device monitor -b 115200 --port COM15
+================================================
+Compile:
+  python -m platformio run
+  python -m platformio run -j 1
 
+Flash:
+  python -m platformio run -t upload --upload-port COM10
 
-facut de:  Alex Cata TONE 
+Monitor:
+  python -m platformio device monitor -b 115200 --port COM15
+
+Monitor + CMD:
+  python -m platformio device monitor -b 115200 --port COM15 --echo
+=======================================================================
+>>>> Commits Info <<<<
+
+>>>>>>> commit 7 start  >>>>>>>>>>
+  Implementat complet cele 3 tipuri de output UART + STATUS extins.
+
+  Ce s-a adaugat in main.cpp:
+    1. BOOT (la pornire)
+      - functie noua printBootInfo() (main.cpp:796)
+      - afiseaza: build date/time, chip id, CPU, heap, reset reason, SSID, timpi cheie
+
+    2. HEARTBEAT periodic
+      - interval: HEARTBEAT_INTERVAL_MS = 30000 (main.cpp:67)
+      - functie printHeartbeatIfNeeded() (main.cpp:754), apelata in loop() (main.cpp:972)
+      - include: time, uptime, state, wifi, emulation, IP, RSSI, ping counter, relay status, heap, cnt_secunda
+
+    3. EVENT la schimbari
+      - functie logEvent() (main.cpp:570)
+      - evenimente legate pe:
+        - schimbare stare alarma (main.cpp:202)
+        - WiFi connect success/fail (main.cpp:352, main.cpp:356)
+        - WiFi transitions up/down (main.cpp:678, main.cpp:680)
+        - ping fail / relay ON/OFF (main.cpp:558, main.cpp:565, main.cpp:605, main.cpp:628)
+        - comenzi UART de emulare (main.cpp:870, main.cpp:881)
+        - setup complete (main.cpp:961)
+
+  STATUS extins (main.cpp:692):
+    - time + uptime
+    - alarm state
+    - WiFi + emulation
+    - IP, RSSI, gateway, DNS
+    - NTP started/ready
+    - ping down active + ping counter + ping interval
+    - last wifi disconnect + ping down start
+    - internet relay active + until/next allowed
+    - wifi disconnected since
+    - cnt_secunda
+    - free heap, chip id
+<<<<<<<< commit 7 finish <<<<<<<<
+
+=============================
+>> commit no. #6 >>>>>>>>>>>>
+
+  Modificari principale:
+    main.cpp
+      - Puls releu Internet schimbat la 10s
+        (INTERNET_RELAY_PULSE_MS = 10'000)
+      - Retry la deconectare Wi-Fi:
+        - prag 2 minute (WIFI_DISCONNECT_RELAY_RETRY_MS = 120'000)
+        - functie noua handleWifiReconnectRelayRetry(), apelata in loop()
+        - daca Wi-Fi ramane picat 2 minute:
+          porneste releul 10 secunde, apoi il opreste
+      - Fast startup in primul minut:
+        - ping la 10s (FAST_STARTUP_PING_INTERVAL_MS)
+        - raportare timp la 5s (FAST_STARTUP_CLOCK_INTERVAL_MS)
+        - revine la intervalele normale (60s ping, 300s clock)
+        - implementat prin currentPingIntervalMs() si currentClockReportIntervalMs()
+
+    config.h
+      - activ: TP-Link_583B / MicroEJ_21
+      - TP-Link_2F48 comentat (evita dubla definire)
+
+    how_to.txt
+      - port monitor serial schimbat din COM14 in COM15
+
+<<<<<< commit no. #6 <<<<<<<<
+
+============================= 
+>> rezumat fata de ultimul commit (09b457a) >>>>>>>>>>>>
+
+  main.cpp
+    - Logica WiFi/relay extinsa:
+      - comenzi UART: EMULATE_WIFI_OFF / EMULATE_WIFI_ON
+      - EMULATE_WIFI_OFF activeaza imediat relay_1
+      - daca WiFi real revine, EMULATE_WIFI_OFF se anuleaza automat
+      - cat timp WiFi este conectat, relay_1 este fortat INACTIVE
+
+    - Timezone si timp:
+      - timezone Romania aplicat explicit pentru sincronizare timp
+      - status-ul afiseaza durata deconectarii WiFi in format h:mm:ss
+      - "Last WiFi disconnect" marcat cu <<<<<<
+
+    - Formatare STATUS refacuta:
+      - blocuri tematice (Stare alarma, Retea WiFi, Conectivitate Internet, Sistem)
+      - header/footer cu contor iteratii:
+        =====  N  ===== >>
+        ...
+        =====  N  =====  <<
+      - 2 enter-uri inainte de header
+      - RSSI afisat ca: rssi=-63
+      - eliminate campurile:
+        Internet relay until
+        Internet relay next allowed
+
+    - Evenimente UART:
+      - format event schimbat la:
+        [ EVENT= ...] : dd/mm/yyyy HH:MM:SS
+      - status instant la prima detectie de internet down / WiFi down
+
+    - Curatare loguri:
+      - eliminata complet logica de print [HEARTBEAT]
+      - eliminat print-ul periodic de timp la 5 minute
+      - eliminat cnt_secunda
+
+  README.md
+    - actualizat cu descriere functionala completa (router power-cycle, flux WiFi/ping)
+
+  how_to.txt
+    - extins cu comenzi UART si istoric modificari / rezumate
+
+<<<<<< rezumat fata de ultimul commit <<<<<<<<
