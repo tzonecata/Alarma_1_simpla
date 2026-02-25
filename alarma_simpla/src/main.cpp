@@ -66,7 +66,8 @@ static const uint32_t STATUS_AUTO_INTERVAL_MS = 30'000;
 static const uint32_t FAST_STARTUP_WINDOW_MS = 60'000;
 static const uint32_t FAST_STARTUP_PING_INTERVAL_MS = 10'000;
 static const uint32_t INTERNET_RELAY_PULSE_MS = 10'000;
-static const uint32_t INTERNET_RELAY_COOLDOWN_MS = 300'000;
+static const uint32_t INTERNET_RELAY_COOLDOWN_MS = 60'000;
+static const uint32_t RELAY_STARTUP_HOLDOFF_MS = 60'000;
 static const uint32_t WIFI_DISCONNECT_RELAY_RETRY_MS = 120'000;
 static const uint32_t EMULATE_WIFI_RETRY_CONNECT_MS = 10'000;
 static const IPAddress GOOGLE_PING_IP(8, 8, 8, 8);
@@ -93,6 +94,9 @@ static bool internetCutActive = false;  // D2 active LOW când cade ping
 static uint32_t internetCutUntilMs = 0;
 static uint32_t internetRelayNextAllowedMs = 0;
 static uint32_t wifiDisconnectedSinceMs = 0;
+static uint32_t relaySchedulerUnlockMs = 0;
+static uint32_t relayInternetActivationCount = 0;
+static uint32_t wifiOffLivePrintLastMs = 0;
 static bool prevWifiConnected = false;
 static bool emulateWifiOff = false;
 static bool emulateWifiOffLogged = false;
@@ -136,6 +140,7 @@ static void handleWifiReconnectRelayRetry();
 static void enforceInternetRelayOffWhenWifiConnected();
 static void updateWifiDisconnectTracking();
 static void printStatusEvery30SecIfNeeded();
+static void printWifiOffLiveTelemetryEverySec();
 static void handleSerialCommands();
 static void processSerialCommand(String cmd);
 static void printRuntimeStatus();
@@ -535,6 +540,7 @@ static void performPingAndReport() {
     pingDownStartRealEpoch = 0;
     internetCutActive = false;
     internetCutUntilMs = 0;
+    internetRelayNextAllowedMs = 0;
 
     Serial.println();
     Serial.print(pingCounter);
@@ -561,8 +567,8 @@ static void performPingAndReport() {
       logEvent("internet_DOWN_detected");
       printRuntimeStatus();
     }
-
-    if (!isWifiConnected() && !internetCutActive && (int32_t)(nowMs - internetRelayNextAllowedMs) >= 0) {
+    if (!internetCutActive && (int32_t)(nowMs - internetRelayNextAllowedMs) >= 0) {
+      ++relayInternetActivationCount;
       internetCutActive = true;
       internetCutUntilMs = nowMs + INTERNET_RELAY_PULSE_MS;
       internetRelayNextAllowedMs = nowMs + INTERNET_RELAY_PULSE_MS + INTERNET_RELAY_COOLDOWN_MS;
@@ -608,31 +614,55 @@ static void updateInternetCutRelayPulse() {
 
 static void enforceInternetRelayOffWhenWifiConnected() {
   if (!isWifiConnected()) return;
+  if (pingDownActive) return;
   if (!internetCutActive && internetCutUntilMs == 0) return;
 
   internetCutActive = false;
   internetCutUntilMs = 0;
+  internetRelayNextAllowedMs = 0;
   logEvent("relay_1_FORCED_INACTIVE_wifi_connected");
 }
 
 static void handleWifiReconnectRelayRetry() {
-  if (isWifiConnected()) {
+  const uint32_t now = millis();
+  if ((int32_t)(now - relaySchedulerUnlockMs) < 0) {
+    // Startup holdoff: keep relay OFF and reset scheduler state.
+    internetCutActive = false;
+    internetCutUntilMs = 0;
+    internetRelayNextAllowedMs = 0;
     wifiDisconnectedSinceMs = 0;
     return;
   }
 
-  const uint32_t now = millis();
-  if (wifiDisconnectedSinceMs == 0) {
-    wifiDisconnectedSinceMs = now;
+  if (isWifiConnected()) {
+    wifiDisconnectedSinceMs = 0;
+    internetRelayNextAllowedMs = 0;
     return;
   }
 
-  if ((now - wifiDisconnectedSinceMs) < WIFI_DISCONNECT_RELAY_RETRY_MS) return;
-  if (internetCutActive) return;
+    if (wifiDisconnectedSinceMs == 0) {
+      wifiDisconnectedSinceMs = now;
+      if (!internetCutActive) {
+        ++relayInternetActivationCount;
+        internetCutActive = true;
+        internetCutUntilMs = now + INTERNET_RELAY_PULSE_MS;
+        internetRelayNextAllowedMs = now + INTERNET_RELAY_PULSE_MS + INTERNET_RELAY_COOLDOWN_MS;
+        logEvent("relay_1_ACTIVATED");
+      }
+    return;
+  }
 
+  if (internetCutActive) return;
+  if (internetRelayNextAllowedMs == 0) {
+    internetRelayNextAllowedMs = now + INTERNET_RELAY_COOLDOWN_MS;
+    return;
+  }
+  if ((int32_t)(now - internetRelayNextAllowedMs) < 0) return;
+
+  ++relayInternetActivationCount;
   internetCutActive = true;
   internetCutUntilMs = now + INTERNET_RELAY_PULSE_MS;
-
+  internetRelayNextAllowedMs = now + INTERNET_RELAY_PULSE_MS + INTERNET_RELAY_COOLDOWN_MS;
   logEvent("relay_1_ACTIVATED");
 }
 
@@ -662,8 +692,31 @@ static void updateWifiDisconnectTracking() {
   prevWifiConnected = connected;
 }
 
+static void printWifiOffLiveTelemetryEverySec() {
+  if (isWifiConnected()) {
+    wifiOffLivePrintLastMs = 0;
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (wifiOffLivePrintLastMs != 0 && (now - wifiOffLivePrintLastMs) < 1000) return;
+  wifiOffLivePrintLastMs = now;
+
+  char ts[24];
+  formatDateTime(ts, sizeof(ts), true);
+  Serial.print(">>{EVENT: ");
+  Serial.print(internetCutActive ? "relay_1_ACTIVATED" : "relay_1_DEACTIVATED");
+  Serial.print(" Wifi is OFF | Date: ");
+  Serial.print(ts);
+  Serial.print(" |  ");
+  Serial.print(relayInternetActivationCount);
+  Serial.println(" incercari de OFF>ON; } <<");
+}
+
 static void printRuntimeStatus() {
   ++statusPrintCounter;
+  char up[32];
+  formatDurationMs(millis(), up, sizeof(up));
   char lastWifiDown[24];
   formatEpochDateTime(lastWifiDisconnectRealEpoch, lastWifiDown, sizeof(lastWifiDown), true);
   const uint32_t pingIntervalMs = currentPingIntervalMs();
@@ -730,7 +783,7 @@ static void printRuntimeStatus() {
   Serial.println(" sec)");
   Serial.println();
 
-  Serial.println("⏱ Sistem");
+  Serial.println("System ::");
   Serial.print("NTP started: ");
   Serial.println(ntpStarted ? "YES" : "NO");
   Serial.print("NTP ready: ");
@@ -739,6 +792,8 @@ static void printRuntimeStatus() {
   Serial.println(ESP.getFreeHeap());
   Serial.print("Chip ID: ");
   Serial.println(ESP.getChipId(), HEX);
+  Serial.print("Uptime: ");
+  Serial.println(up);
   Serial.print("=====  ");
   Serial.print(statusPrintCounter);
   Serial.println("  =====  <<");
@@ -806,6 +861,7 @@ static void processSerialCommand(String cmd) {
   }
 
   if (cmd == "STATUS") {
+    Serial.println("UART CMD: STATUS -> OK");
     printRuntimeStatus();
     return;
   }
@@ -825,6 +881,9 @@ static void processSerialCommand(String cmd) {
       wifiDisconnectedSinceMs = millis();
     }
     WiFi.disconnect();
+    if (!internetCutActive) {
+      ++relayInternetActivationCount;
+    }
     internetCutActive = true;
     internetCutUntilMs = millis() + INTERNET_RELAY_PULSE_MS;
     Serial.println("UART CMD: EMULATE_WIFI_OFF -> WiFi forced DISCONNECTED");
@@ -840,6 +899,7 @@ static void processSerialCommand(String cmd) {
     wifiDisconnectedSinceMs = 0;
     internetCutActive = false;
     internetCutUntilMs = 0;
+    wifiOffLivePrintLastMs = 0;
     Serial.println("UART CMD: EMULATE_WIFI_ON -> WiFi emulation disabled");
     Serial.println("UART CMD: relay INTERNET forced INACTIVE");
     connectWifi();
@@ -917,6 +977,9 @@ void setup() {
 
   setOutputs(false, false, false);
   startupRelayStartupTest();
+  relaySchedulerUnlockMs = millis() + RELAY_STARTUP_HOLDOFF_MS;
+  Serial.println("Relay scheduler holdoff: 60s (relay OFF)");
+  Serial.println();
   enterState(AlarmState::DISARMED);
 
   connectWifi();
@@ -936,6 +999,7 @@ void loop() {
   printStatusEvery30SecIfNeeded();
   updateInternetCutRelayPulse();
   handleWifiReconnectRelayRetry();
+  printWifiOffLiveTelemetryEverySec();
   handleSerialCommands();
   updateButton();
 

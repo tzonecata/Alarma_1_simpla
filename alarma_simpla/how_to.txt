@@ -15,10 +15,20 @@ UART Commands:
   - PINGNOW
     Ruleaza imediat un ping de test catre Internet.
   - EMULATE_WIFI_OFF
-    Forteaza starea WiFi = DISCONNECTED (pentru test).
-    Sistemul se comporta ca si cum a picat conexiunea la router.
+    Forteaza starea WiFi = DISCONNECTED (mod emulat).
+    Sistemul intra pe logica de WiFi OFF si releu Internet.
   - EMULATE_WIFI_ON
     Opreste emularea WiFi OFF si revine la conectarea WiFi normala.
+
+Cum trimiti comenzi UART (WiFi ON/OFF):
+  1. Deschizi monitorul serial cu echo:
+     python -m platformio device monitor -b 115200 --port COM15 --echo
+  2. Scrii comanda si apesi Enter:
+     EMULATE_WIFI_OFF
+     EMULATE_WIFI_ON
+
+
+  
 
 
 ================================================
@@ -36,7 +46,30 @@ Monitor + CMD:
   python -m platformio device monitor -b 115200 --port COM15 --echo
 =======================================================================
 >>>> Commits Info <<<<
+>> commit no. #8 >>>>>>>>>>>>
+  Hash: TO_BE_FILLED_AFTER_COMMIT_8
+  - Internet relay logic actualizata:
+    - trigger imediat la internet down (ping fail): relay ON 10s
+    - ciclu repetitiv la WiFi OFF: 10s ON -> 60s OFF -> 10s ON
+    - la WiFi reconnect + ping OK: relay ramane OFF
+  - Startup relay holdoff:
+    - dupa startup test, releul Internet ramane OFF 60s
+  - UART live WiFi OFF:
+    - print la fiecare 1s cu format:
+      >>{EVENT: relay_1_* Wifi is OFF | Date: ... | N incercari de OFF>ON; } <<
+  - UART commands in how_to:
+    - EMULATE_WIFI_OFF / EMULATE_WIFI_ON + pasii de utilizare in monitor cu --echo
+<<<<<< commit no. #8 <<<<<<<<
 
+>>>>
+- 09b457a
+    Forteaza starea WiFi = DISCONNECTED (pentru test).
+    Sistemul se comporta ca si cum a picat conexiunea la router.
+
+  - EMULATE_WIFI_OFF
+    Opreste emularea WiFi OFF si revine la conectarea WiFi normala.
+
+<<<<
 >>>>>>> commit 7 start  >>>>>>>>>>
   Implementat complet cele 3 tipuri de output UART + STATUS extins.
 
@@ -100,48 +133,3 @@ Monitor + CMD:
       - port monitor serial schimbat din COM14 in COM15
 
 <<<<<< commit no. #6 <<<<<<<<
-
-============================= 
->> rezumat fata de ultimul commit (09b457a) >>>>>>>>>>>>
-
-  main.cpp
-    - Logica WiFi/relay extinsa:
-      - comenzi UART: EMULATE_WIFI_OFF / EMULATE_WIFI_ON
-      - EMULATE_WIFI_OFF activeaza imediat relay_1
-      - daca WiFi real revine, EMULATE_WIFI_OFF se anuleaza automat
-      - cat timp WiFi este conectat, relay_1 este fortat INACTIVE
-
-    - Timezone si timp:
-      - timezone Romania aplicat explicit pentru sincronizare timp
-      - status-ul afiseaza durata deconectarii WiFi in format h:mm:ss
-      - "Last WiFi disconnect" marcat cu <<<<<<
-
-    - Formatare STATUS refacuta:
-      - blocuri tematice (Stare alarma, Retea WiFi, Conectivitate Internet, Sistem)
-      - header/footer cu contor iteratii:
-        =====  N  ===== >>
-        ...
-        =====  N  =====  <<
-      - 2 enter-uri inainte de header
-      - RSSI afisat ca: rssi=-63
-      - eliminate campurile:
-        Internet relay until
-        Internet relay next allowed
-
-    - Evenimente UART:
-      - format event schimbat la:
-        [ EVENT= ...] : dd/mm/yyyy HH:MM:SS
-      - status instant la prima detectie de internet down / WiFi down
-
-    - Curatare loguri:
-      - eliminata complet logica de print [HEARTBEAT]
-      - eliminat print-ul periodic de timp la 5 minute
-      - eliminat cnt_secunda
-
-  README.md
-    - actualizat cu descriere functionala completa (router power-cycle, flux WiFi/ping)
-
-  how_to.txt
-    - extins cu comenzi UART si istoric modificari / rezumate
-
-<<<<<< rezumat fata de ultimul commit <<<<<<<<
