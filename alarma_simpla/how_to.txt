@@ -47,7 +47,7 @@ Monitor + CMD:
 =======================================================================
 >>>> Commits Info <<<<
 >> commit no. #8 >>>>>>>>>>>>
-  Hash: TO_BE_FILLED_AFTER_COMMIT_8
+  Hash: e557971
   - Internet relay logic actualizata:
     - trigger imediat la internet down (ping fail): relay ON 10s
     - ciclu repetitiv la WiFi OFF: 10s ON -> 60s OFF -> 10s ON
